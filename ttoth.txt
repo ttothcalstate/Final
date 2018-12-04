@@ -1,0 +1,202 @@
+ssh mespino6@129.150.128.177
+
+hdfs dfs -mkdir tmp/data
+hdfs dfs -mkdir tmp/data/tables
+hdfs dfs -ls tmp/data/tables
+
+hdfs dfs -chmod -R o+w tmp/
+
+wget -O amazon_reviews_us_Books_v1_02.tsv.gz https://s3.amazonaws.com/amazon-reviews-pds/tsv/amazon_reviews_us_Books_v1_02.tsv.gz
+gunzip -c amazon_reviews_us_Books_v1_02.tsv.gz | hadoop fs -put - /user/mespino6/tmp/data/tables;
+
+beeline 
+
+!connect jdbc:hive2://cis5200-bdcsce-4.compute-608214094.oraclecloud.internal:2181,cis5200-bdcsce-2.compute-608214094.oraclecloud.internal:2181,cis5200-bdcsce-3.compute-608214094.oraclecloud.internal:2181/;serviceDiscoveryMode=zooKeeper;zooKeeperNamespace=hiveserver2?tez.queue.name=interactive bdcsce_admin
+
+Create database TtoTH;
+
+use TtoTH;
+
+CREATE EXTERNAL TABLE amazon_reviews_traditional (
+  marketplace string, 
+  customer_id string, 
+  review_id int, 
+  product_id int, 
+  product_parent string, 
+  product_title string, 
+  product_category string,
+  star_rating int, 
+  helpful_votes int, 
+  total_votes int, 
+  vine string, 
+  verified_purchase string, 
+  review_headline string, 
+  review_body string, 
+  review_date bigint, 
+  year int)
+ 
+ROW FORMAT DELIMITED FIELDS TERMINATED BY '\t' LOCATION '/user/mespino6/tmp/data/tables';
+
+SELECT * FROM amazon_reviews_traditional limit 10;
+
+SELECT COUNT(*) FROM amazon_reviews_traditional;
+
+DESCRIBE amazon_reviews_traditional;
+
+SELECT product_id, FORMAT_NUMBER(avg_star_rating,2) AS avg_star_rating
+FROM (SELECT product_id, AVG(star_rating) AS avg_star_rating, 
+COUNT(*) AS num 
+FROM amazon_reviews_traditional 
+GROUP by product_id) amazon_reviews_traditional 
+WHERE num >=50 
+ORDER BY avg_star_rating DESC 
+LIMIT 1;
+
+SELECT EXPLODE(NGRAMS(SENTENCES(LOWER(review_body)), 2, 5)) AS bigrams FROM amazon_reviews_traditional WHERE product_id = 0072119551;
+
+SELECT review_body FROM amazon_reviews_traditional WHERE product_id = 0072119551 AND review_body LIKE '%the exam%' LIMIT 3;
+
+SELECT review_body FROM amazon_reviews_traditional WHERE product_id = 0072119551 AND review_body LIKE '%70%' LIMIT 2;
+
+SELECT review_headline FROM amazon_reviews_traditional WHERE product_id=0072119551 LIMIT 10;
+
+Use default;
+
+CREATE TABLE TtoTH.dictionary AS select * from dictionary 
+
+Use TtoTH;
+
+SELECT EXPLODE(SPLIT(review_body, ' ')) AS word 
+	FROM amazon_reviews_traditional 
+	WHERE product_id = 0072119551;
+
+SELECT words, dictionary.polarity
+	FROM (SELECT explode(split(review_body, ' ')) 
+	AS words FROM amazon_reviews_traditional 
+	WHERE product_id = 0072119551)
+	a join Dictionary on words=word
+	ORDER by dictionary.polarity, words;
+
+
+SELECT polarity, sum(TimesWordAppearsInReview)
+	FROM(SELECT DISTINCT words, 
+TimesWordAppearsInReview, 
+polarity
+	FROM (SELECT words, COUNT(words) as TimesWordAppearsInReview
+	FROM(SELECT words 
+FROM(SELECT explode(split(review_body, ' ')) AS words
+FROM amazon_reviews_traditional 
+	WHERE product_id = 0072119551) a join Dictionary on words=word
+	ORDER BY words) b 
+GROUP BY words) c 
+JOIN Dictionary on words=word 
+ORDER BY words, polarity) d 
+GROUP by polarity;
+
+SELECT DISTINCT c.words, c.TimesWordAppearsInReview, Dictionary.polarity
+	FROM (SELECT words, COUNT(words) as TimesWordAppearsInReview
+	FROM(SELECT words FROM(SELECT explode(split(review_body, ' ')) as words
+FROM amazon_reviews_traditional 
+	WHERE product_id = 0072119551) a JOIN Dictionary on words=word
+	ORDER BY words) b 
+GROUP by words) c JOIN Dictionary on words=word 
+ORDER by TimesWordAppearsInReview DESC;
+
+SELECT substr(review_body,0,100)
+FROM amazon_reviews_traditional
+	WHERE review_body like '%just%' and product_id = 0072119551; 
+
+CREATE TABLE TtoTH.dictionary_adj AS select * from dictionary where word not in ('just','will');
+
+SELECT polarity, SUM(TimesWordAppearsInReview)
+	FROM (SELECT DISTINCT words, TimesWordAppearsInReview, polarity
+FROM (SELECT words, COUNT(words) as TimesWordAppearsInReview
+FROM (SELECT words 
+FROM (SELECT explode(split(review_body, ' ')) AS words
+FROM amazon_reviews_traditional 
+	WHERE product_id = 0072119551) a 
+JOIN dictionary_adj on words=word
+	ORDER BY words) b 
+GROUP BY words) c 
+JOIN dictionary_adj on words=word 
+ORDER BY words, polarity) d 
+GROUP BY polarity;
+
+CREATE view IF NOT EXISTS temp_One AS
+	SELECT product_id, words
+FROM amazon_reviews_traditional 
+lateral view EXPLODE(SENTENCES(LOWER(review_body))) dummy AS words;
+
+CREATE view IF NOT EXISTS temp_Two AS
+	SELECT product_id, word
+FROM temp_One
+	lateral view explode( words ) dummy AS word;
+
+CREATE view IF NOT EXISTS temp_Three AS 
+SELECT product_id,
+	temp_two.word,
+	case d.polarity
+	when 'negative' then -1
+	when 'positive' then 1
+	else 0 end as polarity
+	from temp_two left outer join dictionary_adj d on temp_two.word = d.word;
+
+CREATE View IF NOT EXISTS productsreview_sentiment AS 
+	SELECT product_id,
+	CASE
+	when sum( polarity ) > 0 then 'positive'
+	when sum( polarity ) < 0 then 'negative'
+	ELSE 'neutral' end as sentiment, sum( polarity ) as sentiment_rating, AVG(polarity) 
+AS sentiment_average
+FROM temp_three 
+GROUP by product_id;
+
+CREATE View IF NOT EXISTS productsreview_avg_star_rating AS
+	SELECT product_id, FORMAT_NUMBER(avg_star_rating,2) AS avg_star_rating
+	FROM (SELECT product_id, AVG(star_rating) AS avg_star_rating, 
+	COUNT(*) AS num 
+FROM amazon_reviews_traditional 
+GROUP by product_id) amazon_reviews_traditional 
+WHERE num >=100; 
+
+CREATE View IF NOT EXISTS 
+consolidates_sentiment_starrating AS
+	SELECT b.product_id, b.sentiment, 
+FORMAT_NUMBER(b.sentiment_average,4) as Sentiment_Range, a.avg_star_rating
+FROM productsreview_avg_star_rating a LEFT OUTER JOIN productsreview_sentiment b on a.product_id = b.product_id;
+
+CREATE View IF NOT EXISTS ProductTitle AS
+	SELECT DISTINCT product_title, product_id 
+FROM amazon_reviews_traditional;
+
+CREATE table IF NOT EXISTS AmazonReviewsInfo
+	STORED AS orc AS 
+	SELECT b.product_title,a.product_id,a.sentiment, a.Sentiment_Range, a.avg_star_rating
+	FROM consolidates_sentiment_starrating a LEFT OUTER JOIN ProductTitle b on a.product_id=b.product_id;
+
+SELECT product_id, sentiment, Sentiment_Range, avg_star_rating
+	FROM AmazonReviewsInfo order by sentiment_range;
+
+hdfs dfs -mkdir tmp/data/info
+hdfs dfs -chmod -R o+w tmp/
+
+CREATE TABLE IF NOT EXISTS AmazonReviewsInformation
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY ","
+STORED AS TEXTFILE
+LOCATION "/user/mespino6/tmp/data/info"
+AS
+select product_id, sentiment, Sentiment_Range, avg_star_rating
+from AmazonReviewsInfo order by sentiment_range;
+
+hdfs dfs -ls /user/mespino6/tmp/data/info
+
+hdfs dfs -get /user/mespino6/tmp/data/info/00000*_0
+
+#RUN PSFTP.exe
+
+open 129.150.128.177;
+
+get 000000_0;
+
+
